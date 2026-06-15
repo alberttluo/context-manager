@@ -1,0 +1,13 @@
+[Unit]
+Description=Claude Code context manager
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/context-managerd
+Restart=always
+RestartSec=3
+# Keep logs in journald: journalctl --user -u context-manager -f
+
+[Install]
+WantedBy=default.target
