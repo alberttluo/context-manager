@@ -59,6 +59,12 @@ pub struct FakeTmux {
     calls: Mutex<Vec<String>>,
 }
 
+impl Default for FakeTmux {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FakeTmux {
     pub fn new() -> Self {
         FakeTmux { calls: Mutex::new(Vec::new()) }

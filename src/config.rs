@@ -46,14 +46,17 @@ impl Default for ModelWindows {
 
 impl Config {
     pub fn from_toml_str(s: &str) -> anyhow::Result<Config> {
-        Ok(toml::from_str(s)?)
+        let mut cfg: Config = toml::from_str(s)?;
+        cfg.model_windows.overrides.remove("default");
+        Ok(cfg)
     }
 
     pub fn load(path: &Path) -> anyhow::Result<Config> {
-        if !path.exists() {
-            return Ok(Config::default());
-        }
-        let text = std::fs::read_to_string(path)?;
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
+            Err(e) => return Err(e.into()),
+        };
         Config::from_toml_str(&text)
     }
 }

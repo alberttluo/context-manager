@@ -17,10 +17,10 @@ Add to `~/.claude/settings.json` (merge into existing `hooks`):
 {
   "hooks": {
     "SessionStart": [
-      { "hooks": [ { "type": "command", "command": "~/.local/bin/cm-hook" } ] }
+      { "matcher": "", "hooks": [ { "type": "command", "command": "~/.local/bin/cm-hook" } ] }
     ],
     "SessionEnd": [
-      { "hooks": [ { "type": "command", "command": "~/.local/bin/cm-hook" } ] }
+      { "matcher": "", "hooks": [ { "type": "command", "command": "~/.local/bin/cm-hook" } ] }
     ]
   }
 }

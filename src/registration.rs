@@ -11,11 +11,19 @@ pub struct Registration {
     pub started_at: String,
 }
 
+fn validate_session_id(session_id: &str) -> anyhow::Result<()> {
+    if session_id.contains('/') || session_id.contains('\\') || session_id.contains("..") {
+        anyhow::bail!("invalid session_id: {session_id}");
+    }
+    Ok(())
+}
+
 fn reg_path(dir: &Path, session_id: &str) -> PathBuf {
     dir.join(format!("{session_id}.json"))
 }
 
 pub fn write(dir: &Path, reg: &Registration) -> anyhow::Result<()> {
+    validate_session_id(&reg.session_id)?;
     std::fs::create_dir_all(dir)?;
     let json = serde_json::to_string_pretty(reg)?;
     std::fs::write(reg_path(dir, &reg.session_id), json)?;
@@ -23,6 +31,7 @@ pub fn write(dir: &Path, reg: &Registration) -> anyhow::Result<()> {
 }
 
 pub fn remove(dir: &Path, session_id: &str) -> anyhow::Result<()> {
+    validate_session_id(session_id)?;
     let p = reg_path(dir, session_id);
     if p.exists() {
         std::fs::remove_file(p)?;
@@ -91,5 +100,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope");
         assert_eq!(scan(&missing).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn rejects_session_id_with_path_separators() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = Registration {
+            session_id: "../evil".into(),
+            transcript_path: "/tmp/t.jsonl".into(),
+            cwd: "/tmp".into(),
+            tmux_pane: "%1".into(),
+            pid: 1,
+            started_at: "2026-06-15T00:00:00Z".into(),
+        };
+        assert!(write(dir.path(), &reg).is_err());
     }
 }
