@@ -1,0 +1,28 @@
+[package]
+name = "context-manager"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "context_manager"
+path = "src/lib.rs"
+
+[[bin]]
+name = "context-managerd"
+path = "src/bin/context-managerd.rs"
+
+[[bin]]
+name = "cm-hook"
+path = "src/bin/cm-hook.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+directories = "5"
+
+[dev-dependencies]
+tempfile = "3"
