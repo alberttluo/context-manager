@@ -6,7 +6,6 @@ use std::io::Read;
 
 #[derive(Deserialize)]
 struct HookInput {
-    #[serde(default)]
     session_id: String,
     #[serde(default)]
     transcript_path: String,
@@ -30,9 +29,10 @@ fn main() -> anyhow::Result<()> {
 
     let dir = sessions_dir()?;
 
-    // SessionEnd: deregister and exit.
     if input.hook_event_name.eq_ignore_ascii_case("SessionEnd") {
         registration::remove(&dir, &input.session_id)?;
+        return Ok(());
+    } else if !input.hook_event_name.eq_ignore_ascii_case("SessionStart") {
         return Ok(());
     }
 
