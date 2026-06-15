@@ -32,10 +32,7 @@ fn dry_run_decides_handoff_for_over_threshold_quiet_session() {
 
     // quiet_period_secs = 0 and grace_secs = 0 so the state machine can reach
     // ExecuteHandoff within two ticks of the same logical instant.
-    let mut config = Config::default();
-    config.dry_run = true;
-    config.quiet_period_secs = 0;
-    config.grace_secs = 0;
+    let config = Config { dry_run: true, quiet_period_secs: 0, grace_secs: 0, ..Default::default() };
 
     let fake = FakeTmux::new();
     let daemon = Daemon { config, paths: &paths, tmux: &fake };

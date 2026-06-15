@@ -7,6 +7,7 @@ pub trait TmuxControl {
     fn send_enter(&self, pane: &str) -> anyhow::Result<()>;
     fn respawn(&self, pane: &str, command: &str) -> anyhow::Result<()>;
     fn pane_alive(&self, pane: &str) -> anyhow::Result<bool>;
+    fn display_message(&self, pane: &str, msg: &str) -> anyhow::Result<()>;
 }
 
 pub struct RealTmux;
@@ -53,6 +54,14 @@ impl TmuxControl for RealTmux {
         let stdout = String::from_utf8_lossy(&out.stdout);
         Ok(stdout.lines().any(|l| l.trim() == pane))
     }
+
+    fn display_message(&self, pane: &str, msg: &str) -> anyhow::Result<()> {
+        let out = RealTmux::run(&["display-message", "-t", pane, msg])?;
+        if !out.status.success() {
+            bail!("tmux display-message failed for pane {pane}");
+        }
+        Ok(())
+    }
 }
 
 pub struct FakeTmux {
@@ -93,6 +102,11 @@ impl TmuxControl for FakeTmux {
 
     fn pane_alive(&self, _pane: &str) -> anyhow::Result<bool> {
         Ok(true)
+    }
+
+    fn display_message(&self, pane: &str, msg: &str) -> anyhow::Result<()> {
+        self.calls.lock().unwrap().push(format!("display_message:{pane}:{msg}"));
+        Ok(())
     }
 }
 

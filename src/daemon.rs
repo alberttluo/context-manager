@@ -106,7 +106,7 @@ impl<'a> Daemon<'a> {
         // Best-effort, non-fatal: display a tmux message on the pane.
         // Skipped in dry-run so tests and observation-only mode never touch tmux.
         if !self.config.dry_run {
-            let _ = self.tmux.send_text(&reg.tmux_pane, "");
+            let _ = self.tmux.display_message(&reg.tmux_pane, &msg);
         }
         eprintln!("{msg} (session {})", reg.session_id);
     }
@@ -182,6 +182,9 @@ impl<'a> Daemon<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registration::{self as registration, Registration};
+    use crate::tmux::FakeTmux;
+    use crate::monitor::SessionMonitor;
 
     #[test]
     fn detects_mtime_change() {
@@ -194,5 +197,69 @@ mod tests {
         assert!(tracker.changed("sess", Some(200)));
         // Missing mtime (file gone): no change reported.
         assert!(!tracker.changed("sess", None));
+    }
+
+    #[test]
+    fn notify_grace_displays_message_on_real_session() {
+        let base = tempfile::tempdir().unwrap();
+        let config_dir = base.path().join("config");
+        let state_dir = base.path().join("state");
+        let paths = crate::paths::Paths::with_base(config_dir, state_dir);
+
+        // Transcript over threshold (120k of ~200k window = 60%), last entry assistant.
+        let transcript = base.path().join("sess.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"assistant\",\"message\":{\"model\":\"m\",\"usage\":{\"cache_read_input_tokens\":120000}}}\n",
+        )
+        .unwrap();
+
+        let reg = Registration {
+            session_id: "sess".into(),
+            transcript_path: transcript,
+            cwd: "/tmp".into(),
+            tmux_pane: "%1".into(),
+            pid: 1,
+            started_at: "2026-06-15T12:00:00Z".into(),
+        };
+        registration::write(&paths.sessions_dir(), &reg).unwrap();
+
+        // dry_run = false so notify_grace actually calls display_message.
+        // grace_secs = 100 keeps the state machine at NotifyGrace (never reaches
+        // ExecuteHandoff at the same logical Instant), so respawn is never called.
+        let config = Config {
+            dry_run: false,
+            quiet_period_secs: 0,
+            grace_secs: 100,
+            ..Default::default()
+        };
+
+        let fake = FakeTmux::new();
+        let daemon = Daemon { config, paths: &paths, tmux: &fake };
+
+        let mut monitors: HashMap<String, SessionMonitor> = HashMap::new();
+        let mut mtimes = MtimeTracker::default();
+
+        let t0 = Instant::now();
+        // Tick 1: first observation registers baseline mtime (counts as change) -> Idle.
+        daemon.tick(t0, &mut monitors, &mut mtimes).unwrap();
+        // Tick 2: no change, quiet>=0, over threshold -> NotifyGrace.
+        daemon.tick(t0, &mut monitors, &mut mtimes).unwrap();
+
+        let calls = fake.calls();
+        let display_call = calls.iter().find(|c| c.starts_with("display_message:"));
+        assert!(
+            display_call.is_some(),
+            "expected a display_message call, got: {calls:?}"
+        );
+        assert!(
+            display_call.unwrap().contains("defer"),
+            "expected message to mention deferring, got: {display_call:?}"
+        );
+        // Grace window not elapsed — no respawn should have been issued.
+        assert!(
+            !calls.iter().any(|c| c.starts_with("respawn:")),
+            "unexpected respawn call: {calls:?}"
+        );
     }
 }
