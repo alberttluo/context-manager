@@ -68,7 +68,7 @@ where
     let poll = Duration::from_secs(1);
     let mut waited = 0u64;
     let mut last_size: Option<u64> = None;
-    while waited <= timeout_secs {
+    while waited < timeout_secs {
         if let Ok(meta) = std::fs::metadata(path) {
             let size = meta.len();
             if size > 0 && last_size == Some(size) {
