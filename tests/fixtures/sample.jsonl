@@ -1,0 +1,5 @@
+{"type":"file-history-snapshot"}
+{"type":"user","message":{"role":"user"}}
+{"type":"assistant","message":{"model":"claude-opus-4-8","usage":{"input_tokens":10,"cache_creation_input_tokens":1000,"cache_read_input_tokens":50000,"output_tokens":40}}}
+{"type":"user","message":{"role":"user"}}
+{"type":"assistant","message":{"model":"claude-opus-4-8","usage":{"input_tokens":6,"cache_creation_input_tokens":2000,"cache_read_input_tokens":120000,"output_tokens":80}}}
