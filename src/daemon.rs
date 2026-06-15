@@ -71,7 +71,7 @@ impl<'a> Daemon<'a> {
         mtimes: &mut MtimeTracker,
     ) -> anyhow::Result<()> {
         let state = transcript::analyze(&reg.transcript_path)?;
-        let window = resolve_window(state.model.as_deref(), &self.config);
+        let window = resolve_window(state.model.as_deref(), state.max_context_tokens, &self.config);
         let pct = if window == 0 { 0.0 } else { state.context_tokens as f64 / window as f64 };
         let changed = mtimes.changed(&reg.session_id, mtime_secs(&reg.transcript_path));
 
