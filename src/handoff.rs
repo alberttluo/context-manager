@@ -31,11 +31,16 @@ fn seed_command(path: &Path) -> String {
     )
 }
 
-/// Drive the live session to write a handoff doc, wait for it, then respawn the
-/// pane with a fresh seeded session. Returns the handoff file path on success.
+/// Drive the live session to write a handoff doc, wait for it, then relaunch the
+/// pane: respawn it into a fresh interactive shell and type the seeded claude
+/// command into it. Returns the handoff file path on success.
+///
+/// Launching via the shell (not `respawn-pane 'claude ...'`) is essential — the
+/// shell sources init files so the full environment (certs/proxy/PATH) is
+/// present, and the pane survives if claude exits.
 ///
 /// On any failure (timeout, tmux error) the pane is left untouched — we never
-/// respawn unless the handoff file is present and stable.
+/// relaunch unless the handoff file is present and stable.
 pub fn perform_handoff<S>(
     tmux: &dyn TmuxControl,
     opts: &HandoffOptions,
@@ -54,7 +59,12 @@ where
 
     wait_for_stable_file(&handoff_path, opts.timeout_secs, &mut sleep_fn)?;
 
-    tmux.respawn(&opts.pane, &seed_command(&handoff_path))?;
+    // Relaunch in-place: fresh interactive shell, then type the seeded claude
+    // command into it (see perform_handoff/respawn_shell docs for why).
+    tmux.respawn_shell(&opts.pane)?;
+    sleep_fn(Duration::from_secs(3)); // let the shell finish sourcing init files
+    tmux.send_text(&opts.pane, &seed_command(&handoff_path))?;
+    tmux.send_enter(&opts.pane)?;
     Ok(handoff_path)
 }
 
@@ -121,10 +131,12 @@ mod tests {
         assert!(calls[0].starts_with("send_text:%5:"));
         assert!(calls[0].contains(expected.to_str().unwrap()));
         assert_eq!(calls[1], "send_enter:%5");
-        // Then it respawns the pane with a claude command that reads the handoff.
-        let respawn = calls.iter().find(|c| c.starts_with("respawn:%5:")).unwrap();
-        assert!(respawn.contains("claude"));
-        assert!(respawn.contains(expected.to_str().unwrap()));
+        // Then it respawns the pane into a shell...
+        assert!(calls.iter().any(|c| c == "respawn_shell:%5"));
+        // ...and types the seeded claude command (the 2nd send_text) into it.
+        let seed = calls.iter().filter(|c| c.starts_with("send_text:%5:")).nth(1).unwrap();
+        assert!(seed.contains("claude"));
+        assert!(seed.contains(expected.to_str().unwrap()));
     }
 
     #[test]
@@ -140,7 +152,7 @@ mod tests {
         let sleep_fn = |_d: std::time::Duration| {};
         let result = perform_handoff(&fake, &opts, sleep_fn);
         assert!(result.is_err());
-        // It must NOT have respawned the pane on failure.
-        assert!(!fake.calls().iter().any(|c| c.starts_with("respawn:")));
+        // It must NOT have relaunched the pane on failure.
+        assert!(!fake.calls().iter().any(|c| c.starts_with("respawn_shell:")));
     }
 }

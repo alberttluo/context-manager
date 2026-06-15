@@ -12,7 +12,7 @@ pub struct PaneInfo {
 pub trait TmuxControl {
     fn send_text(&self, pane: &str, text: &str) -> anyhow::Result<()>;
     fn send_enter(&self, pane: &str) -> anyhow::Result<()>;
-    fn respawn(&self, pane: &str, command: &str) -> anyhow::Result<()>;
+    fn respawn_shell(&self, pane: &str) -> anyhow::Result<()>;
     fn pane_alive(&self, pane: &str) -> anyhow::Result<bool>;
     fn display_message(&self, pane: &str, msg: &str) -> anyhow::Result<()>;
     fn list_panes(&self) -> anyhow::Result<Vec<PaneInfo>>;
@@ -45,9 +45,16 @@ impl TmuxControl for RealTmux {
         Ok(())
     }
 
-    fn respawn(&self, pane: &str, command: &str) -> anyhow::Result<()> {
-        // -k kills the existing pane process before launching the new command.
-        let out = RealTmux::run(&["respawn-pane", "-k", "-t", pane, command])?;
+    fn respawn_shell(&self, pane: &str) -> anyhow::Result<()> {
+        // -k kills the existing process; with NO command, tmux starts the
+        // default shell as a normal interactive login shell, so .zshrc runs and
+        // the full environment (PATH, NODE_EXTRA_CA_CERTS, proxy vars) loads.
+        // Launching claude by typing into this shell — rather than
+        // `respawn-pane 'claude ...'` which runs via a bare `sh -c` that skips
+        // shell init — is what makes the API/certs work. It also means the pane
+        // survives if claude later exits: it falls back to the shell prompt
+        // instead of the pane (and its window) being destroyed.
+        let out = RealTmux::run(&["respawn-pane", "-k", "-t", pane])?;
         if !out.status.success() {
             bail!("tmux respawn-pane failed for pane {pane}");
         }
@@ -130,8 +137,8 @@ impl TmuxControl for FakeTmux {
         Ok(())
     }
 
-    fn respawn(&self, pane: &str, command: &str) -> anyhow::Result<()> {
-        self.calls.lock().unwrap().push(format!("respawn:{pane}:{command}"));
+    fn respawn_shell(&self, pane: &str) -> anyhow::Result<()> {
+        self.calls.lock().unwrap().push(format!("respawn_shell:{pane}"));
         Ok(())
     }
 
@@ -158,11 +165,11 @@ mod tests {
         let fake = FakeTmux::new();
         fake.send_text("%1", "hello").unwrap();
         fake.send_enter("%1").unwrap();
-        fake.respawn("%1", "claude \"go\"").unwrap();
+        fake.respawn_shell("%1").unwrap();
         let calls = fake.calls();
         assert_eq!(calls[0], "send_text:%1:hello");
         assert_eq!(calls[1], "send_enter:%1");
-        assert_eq!(calls[2], "respawn:%1:claude \"go\"");
+        assert_eq!(calls[2], "respawn_shell:%1");
     }
 
     #[test]
