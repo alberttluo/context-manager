@@ -104,7 +104,10 @@ impl<'a> Daemon<'a> {
             self.config.grace_secs
         );
         // Best-effort, non-fatal: display a tmux message on the pane.
-        let _ = self.tmux.send_text(&reg.tmux_pane, "");
+        // Skipped in dry-run so tests and observation-only mode never touch tmux.
+        if !self.config.dry_run {
+            let _ = self.tmux.send_text(&reg.tmux_pane, "");
+        }
         eprintln!("{msg} (session {})", reg.session_id);
     }
 
