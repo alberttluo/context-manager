@@ -38,6 +38,7 @@ pub struct Daemon<'a> {
     pub config: Config,
     pub paths: &'a Paths,
     pub tmux: &'a dyn TmuxControl,
+    pub claude_projects_dir: std::path::PathBuf,
 }
 
 impl<'a> Daemon<'a> {
@@ -165,12 +166,43 @@ impl<'a> Daemon<'a> {
         }
     }
 
+    pub fn discover_and_register(&self) -> anyhow::Result<usize> {
+        let panes = self.tmux.list_panes()?;
+        let found = crate::discovery::discover_sessions(
+            &panes,
+            &self.claude_projects_dir,
+            &self.config.ignore_cwds,
+        );
+        let dir = self.paths.sessions_dir();
+        let mut n = 0;
+        for reg in found {
+            let path = dir.join(format!("{}.json", reg.session_id));
+            if path.exists() {
+                continue;
+            }
+            if crate::registration::write(&dir, &reg).is_ok() {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
     /// Block forever, ticking every `poll_interval_secs`.
     pub fn run(&self) -> anyhow::Result<()> {
         let mut monitors: HashMap<String, SessionMonitor> = HashMap::new();
         let mut mtimes = MtimeTracker::default();
         let interval = Duration::from_secs(self.config.poll_interval_secs.max(1));
+        let discovery_interval = Duration::from_secs(self.config.discovery_interval_secs.max(1));
+        let mut last_discovery = Instant::now() - discovery_interval; // trigger immediately
         loop {
+            if last_discovery.elapsed() >= discovery_interval {
+                match self.discover_and_register() {
+                    Ok(n) if n > 0 => eprintln!("[cm] discovered {n} new session(s)"),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("[cm] discovery error: {e:#}"),
+                }
+                last_discovery = Instant::now();
+            }
             if let Err(e) = self.tick(Instant::now(), &mut monitors, &mut mtimes) {
                 eprintln!("[cm] tick error: {e:#}");
             }
@@ -235,7 +267,13 @@ mod tests {
         };
 
         let fake = FakeTmux::new();
-        let daemon = Daemon { config, paths: &paths, tmux: &fake };
+        let projects_dir = tempfile::tempdir().unwrap();
+        let daemon = Daemon {
+            config,
+            paths: &paths,
+            tmux: &fake,
+            claude_projects_dir: projects_dir.path().to_path_buf(),
+        };
 
         let mut monitors: HashMap<String, SessionMonitor> = HashMap::new();
         let mut mtimes = MtimeTracker::default();

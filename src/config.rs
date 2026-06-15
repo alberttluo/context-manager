@@ -13,6 +13,8 @@ pub struct Config {
     pub handoff_timeout_secs: u64,
     pub dry_run: bool,
     pub model_windows: ModelWindows,
+    pub ignore_cwds: Vec<String>,
+    pub discovery_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -34,6 +36,8 @@ impl Default for Config {
             handoff_timeout_secs: 180,
             dry_run: false,
             model_windows: ModelWindows::default(),
+            ignore_cwds: Vec::new(),
+            discovery_interval_secs: 15,
         }
     }
 }
@@ -76,6 +80,8 @@ mod tests {
         assert_eq!(c.handoff_timeout_secs, 180);
         assert!(!c.dry_run);
         assert_eq!(c.model_windows.default, 200_000);
+        assert!(c.ignore_cwds.is_empty());
+        assert_eq!(c.discovery_interval_secs, 15);
     }
 
     #[test]

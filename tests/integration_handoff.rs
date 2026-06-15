@@ -35,7 +35,7 @@ fn dry_run_decides_handoff_for_over_threshold_quiet_session() {
     let config = Config { dry_run: true, quiet_period_secs: 0, grace_secs: 0, ..Default::default() };
 
     let fake = FakeTmux::new();
-    let daemon = Daemon { config, paths: &paths, tmux: &fake };
+    let daemon = Daemon { config, paths: &paths, tmux: &fake, claude_projects_dir: base.path().join("claude-projects") };
 
     let mut monitors: HashMap<String, SessionMonitor> = HashMap::new();
     let mut mtimes = MtimeTracker::default();

@@ -37,7 +37,10 @@ fn main() -> Result<()> {
     );
 
     let tmux = RealTmux;
-    let daemon = Daemon { config, paths: &paths, tmux: &tmux };
+    let claude_projects_dir = directories::BaseDirs::new()
+        .map(|b| b.home_dir().join(".claude/projects"))
+        .unwrap_or_default();
+    let daemon = Daemon { config, paths: &paths, tmux: &tmux, claude_projects_dir };
 
     if args.once {
         let mut monitors = HashMap::new();

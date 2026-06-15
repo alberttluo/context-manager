@@ -10,3 +10,4 @@ pub mod lineage;
 pub mod handoff;
 pub mod paths;
 pub mod daemon;
+pub mod discovery;
