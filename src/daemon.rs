@@ -168,12 +168,35 @@ impl<'a> Daemon<'a> {
 
     pub fn discover_and_register(&self) -> anyhow::Result<usize> {
         let panes = self.tmux.list_panes()?;
+        let live_pane_ids: std::collections::HashSet<&str> =
+            panes.iter().map(|p| p.pane_id.as_str()).collect();
         let found = crate::discovery::discover_sessions(
             &panes,
             &self.claude_projects_dir,
             &self.config.ignore_cwds,
         );
+        // Authoritative pane -> current session from this scan.
+        let current_by_pane: HashMap<&str, &str> = found
+            .iter()
+            .map(|r| (r.tmux_pane.as_str(), r.session_id.as_str()))
+            .collect();
         let dir = self.paths.sessions_dir();
+
+        // Reconcile: a pane has exactly one session. Drop any registration whose
+        // pane now runs a different session (e.g. the old one after a handoff or
+        // a /clear), or whose pane no longer exists. This dedups by pane and
+        // prunes dead panes — registration files otherwise only vanish on the
+        // SessionEnd hook or a successful handoff.
+        for reg in crate::registration::scan(&dir).unwrap_or_default() {
+            let stale = match current_by_pane.get(reg.tmux_pane.as_str()) {
+                Some(&current) => current != reg.session_id,
+                None => !live_pane_ids.contains(reg.tmux_pane.as_str()),
+            };
+            if stale {
+                let _ = crate::registration::remove(&dir, &reg.session_id);
+            }
+        }
+
         let mut n = 0;
         for reg in found {
             let path = dir.join(format!("{}.json", reg.session_id));
@@ -215,7 +238,7 @@ impl<'a> Daemon<'a> {
 mod tests {
     use super::*;
     use crate::registration::{self as registration, Registration};
-    use crate::tmux::FakeTmux;
+    use crate::tmux::{FakeTmux, PaneInfo};
     use crate::monitor::SessionMonitor;
 
     #[test]
@@ -299,5 +322,61 @@ mod tests {
             !calls.iter().any(|c| c.starts_with("respawn:")),
             "unexpected respawn call: {calls:?}"
         );
+    }
+
+    #[test]
+    fn discovery_reconciles_pane_to_single_session() {
+        let base = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::with_base(
+            base.path().join("config"),
+            base.path().join("state"),
+        );
+        let projects = tempfile::tempdir().unwrap();
+
+        // Pane %7 (cwd /work/proj) currently runs session "sessNew".
+        let proj_dir = projects.path().join(crate::discovery::encode_project_dir("/work/proj"));
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        std::fs::write(proj_dir.join("sessNew.jsonl"), "{}\n").unwrap();
+
+        let sdir = paths.sessions_dir();
+        // Stale leftover for the SAME pane but an older session.
+        registration::write(&sdir, &Registration {
+            session_id: "sessOld".into(),
+            transcript_path: "/old.jsonl".into(),
+            cwd: "/work/proj".into(),
+            tmux_pane: "%7".into(),
+            pid: 0,
+            started_at: "x".into(),
+        }).unwrap();
+        // Registration for a pane that no longer exists.
+        registration::write(&sdir, &Registration {
+            session_id: "ghost".into(),
+            transcript_path: "/ghost.jsonl".into(),
+            cwd: "/gone".into(),
+            tmux_pane: "%99".into(),
+            pid: 0,
+            started_at: "x".into(),
+        }).unwrap();
+
+        let fake = FakeTmux::new();
+        fake.set_panes(vec![PaneInfo {
+            pane_id: "%7".into(),
+            cwd: "/work/proj".into(),
+            command: "claude".into(),
+        }]);
+        let daemon = Daemon {
+            config: Config::default(),
+            paths: &paths,
+            tmux: &fake,
+            claude_projects_dir: projects.path().to_path_buf(),
+        };
+
+        daemon.discover_and_register().unwrap();
+
+        let regs = registration::scan(&sdir).unwrap();
+        let ids: Vec<&str> = regs.iter().map(|r| r.session_id.as_str()).collect();
+        // Stale same-pane session and dead-pane session pruned; only current remains.
+        assert_eq!(ids, vec!["sessNew"], "expected only the current session, got {ids:?}");
+        assert_eq!(regs[0].tmux_pane, "%7");
     }
 }
