@@ -33,6 +33,44 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
+/// Flags whose value is the following argv token (kept together).
+const VALUE_FLAGS: &[&str] = &[
+    "--model", "--fallback-model", "--permission-mode", "--permission-prompt-tool",
+    "--add-dir", "--mcp-config", "--settings", "--setting-sources",
+    "--append-system-prompt", "--allowedTools", "--disallowedTools", "--agents",
+    "--output-format", "--input-format", "--session-id",
+];
+/// Session-continuation flags — dropped, since a handoff starts a FRESH session.
+const DROP_FLAGS: &[&str] = &["--continue", "-c", "--resume", "-r"];
+
+/// Keep the original session's option flags (and their values) while dropping
+/// any stale positional prompt and session-continuation flags, so the successor
+/// inherits the same configuration but receives only our handoff prompt.
+fn sanitize_launch_flags(raw: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < raw.len() {
+        let arg = &raw[i];
+        if !arg.starts_with('-') {
+            i += 1; // bare positional (e.g. a stale initial prompt) — drop it
+            continue;
+        }
+        let name = arg.split('=').next().unwrap_or(arg);
+        if DROP_FLAGS.contains(&name) {
+            i += 1;
+            continue;
+        }
+        out.push(arg.clone());
+        if !arg.contains('=') && VALUE_FLAGS.contains(&name) && i + 1 < raw.len() {
+            out.push(raw[i + 1].clone());
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Build the successor launch command, reusing the original session's flags
 /// (e.g. --dangerously-skip-permissions, --model) so it behaves identically,
 /// and passing the handoff doc as the initial prompt.
@@ -71,7 +109,7 @@ where
 
     // Capture the original session's launch flags while it is still alive, so the
     // successor inherits them (best-effort: no flags on failure).
-    let launch_flags = tmux.pane_launch_flags(&opts.pane).unwrap_or_default();
+    let launch_flags = sanitize_launch_flags(&tmux.pane_launch_flags(&opts.pane).unwrap_or_default());
 
     tmux.send_text(&opts.pane, &handoff_prompt(&handoff_path))?;
     tmux.send_enter(&opts.pane)?;
@@ -121,9 +159,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let handoff_dir = dir.path().join("handoffs");
         let fake = FakeTmux::new();
-        // The original session was launched with these flags; the successor must
-        // inherit them.
-        fake.set_launch_flags(vec!["--dangerously-skip-permissions".into(), "--model".into(), "opus".into()]);
+        // The original session's raw argv: real flags + a value flag + a
+        // session-continuation flag + a stale positional prompt. The successor
+        // must inherit the real flags but NOT --continue or the stale prompt.
+        fake.set_launch_flags(vec![
+            "--dangerously-skip-permissions".into(),
+            "--continue".into(),
+            "--model".into(), "opus".into(),
+            "Reply with READY then wait.".into(),
+        ]);
 
         // Pre-create the handoff file so wait returns immediately. In real use
         // the live session writes it; here we simulate that the moment send_text
@@ -162,6 +206,29 @@ mod tests {
         assert!(seed.contains("--dangerously-skip-permissions"));
         assert!(seed.contains("--model opus"));
         assert!(seed.contains(expected.to_str().unwrap()));
+        // Stale positional prompt and --continue must NOT leak into the successor.
+        assert!(!seed.contains("Reply with READY"));
+        assert!(!seed.contains("--continue"));
+    }
+
+    #[test]
+    fn sanitize_keeps_flags_drops_prompt_and_continuation() {
+        let raw = vec![
+            "--dangerously-skip-permissions".to_string(),
+            "--continue".to_string(),
+            "--model".to_string(), "opus".to_string(),
+            "--resume".to_string(),
+            "stale prompt".to_string(),
+        ];
+        assert_eq!(
+            sanitize_launch_flags(&raw),
+            vec!["--dangerously-skip-permissions", "--model", "opus"]
+        );
+        // --flag=value form is kept whole; no value-token is consumed after it.
+        assert_eq!(
+            sanitize_launch_flags(&["--model=opus".to_string(), "old".to_string()]),
+            vec!["--model=opus"]
+        );
     }
 
     #[test]
