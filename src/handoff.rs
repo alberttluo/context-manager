@@ -24,11 +24,26 @@ writing the file, reply with exactly: HANDOFF_COMPLETE",
     )
 }
 
-fn seed_command(path: &Path) -> String {
-    format!(
-        "claude \"Read the handoff document at {} and continue the work described there.\"",
+/// Quote a single token for safe inclusion in a shell command line.
+fn shell_quote(s: &str) -> String {
+    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/' | b'=' | b':' | b',' | b'@' | b'+')) {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+/// Build the successor launch command, reusing the original session's flags
+/// (e.g. --dangerously-skip-permissions, --model) so it behaves identically,
+/// and passing the handoff doc as the initial prompt.
+fn seed_command(path: &Path, launch_flags: &[String]) -> String {
+    let mut parts = vec!["claude".to_string()];
+    parts.extend(launch_flags.iter().map(|f| shell_quote(f)));
+    parts.push(shell_quote(&format!(
+        "Read the handoff document at {} and continue the work described there.",
         path.display()
-    )
+    )));
+    parts.join(" ")
 }
 
 /// Drive the live session to write a handoff doc, wait for it, then relaunch the
@@ -54,6 +69,10 @@ where
     // Stale file from a prior aborted attempt must not be mistaken for success.
     let _ = std::fs::remove_file(&handoff_path);
 
+    // Capture the original session's launch flags while it is still alive, so the
+    // successor inherits them (best-effort: no flags on failure).
+    let launch_flags = tmux.pane_launch_flags(&opts.pane).unwrap_or_default();
+
     tmux.send_text(&opts.pane, &handoff_prompt(&handoff_path))?;
     tmux.send_enter(&opts.pane)?;
 
@@ -63,7 +82,7 @@ where
     // command into it (see perform_handoff/respawn_shell docs for why).
     tmux.respawn_shell(&opts.pane)?;
     sleep_fn(Duration::from_secs(3)); // let the shell finish sourcing init files
-    tmux.send_text(&opts.pane, &seed_command(&handoff_path))?;
+    tmux.send_text(&opts.pane, &seed_command(&handoff_path, &launch_flags))?;
     tmux.send_enter(&opts.pane)?;
     Ok(handoff_path)
 }
@@ -102,6 +121,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let handoff_dir = dir.path().join("handoffs");
         let fake = FakeTmux::new();
+        // The original session was launched with these flags; the successor must
+        // inherit them.
+        fake.set_launch_flags(vec!["--dangerously-skip-permissions".into(), "--model".into(), "opus".into()]);
 
         // Pre-create the handoff file so wait returns immediately. In real use
         // the live session writes it; here we simulate that the moment send_text
@@ -133,9 +155,12 @@ mod tests {
         assert_eq!(calls[1], "send_enter:%5");
         // Then it respawns the pane into a shell...
         assert!(calls.iter().any(|c| c == "respawn_shell:%5"));
-        // ...and types the seeded claude command (the 2nd send_text) into it.
+        // ...and types the seeded claude command (the 2nd send_text) into it,
+        // carrying the original launch flags.
         let seed = calls.iter().filter(|c| c.starts_with("send_text:%5:")).nth(1).unwrap();
         assert!(seed.contains("claude"));
+        assert!(seed.contains("--dangerously-skip-permissions"));
+        assert!(seed.contains("--model opus"));
         assert!(seed.contains(expected.to_str().unwrap()));
     }
 

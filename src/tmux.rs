@@ -16,6 +16,10 @@ pub trait TmuxControl {
     fn pane_alive(&self, pane: &str) -> anyhow::Result<bool>;
     fn display_message(&self, pane: &str, msg: &str) -> anyhow::Result<()>;
     fn list_panes(&self) -> anyhow::Result<Vec<PaneInfo>>;
+    /// The flags the pane's `claude` process was launched with (argv after the
+    /// program), so a successor can be started identically. Empty if none can
+    /// be determined.
+    fn pane_launch_flags(&self, pane: &str) -> anyhow::Result<Vec<String>>;
 }
 
 pub struct RealTmux;
@@ -99,11 +103,81 @@ impl TmuxControl for RealTmux {
             .collect();
         Ok(panes)
     }
+
+    fn pane_launch_flags(&self, pane: &str) -> anyhow::Result<Vec<String>> {
+        let out = RealTmux::run(&["display-message", "-p", "-t", pane, "#{pane_pid}"])?;
+        if !out.status.success() {
+            return Ok(Vec::new());
+        }
+        let pane_pid: u32 = match String::from_utf8_lossy(&out.stdout).trim().parse() {
+            Ok(p) => p,
+            Err(_) => return Ok(Vec::new()),
+        };
+        Ok(claude_launch_flags(pane_pid))
+    }
+}
+
+/// argv of a process from /proc/<pid>/cmdline (NUL-delimited), or empty.
+fn proc_argv(pid: u32) -> Vec<String> {
+    match std::fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(bytes) => bytes
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn proc_ppid(pid: u32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:").and_then(|r| r.trim().parse().ok()))
+}
+
+fn argv0_is_claude(argv: &[String]) -> bool {
+    argv.first()
+        .map(|a| a.rsplit('/').next().unwrap_or(a) == "claude")
+        .unwrap_or(false)
+}
+
+/// Find the `claude` process at or below `root_pid` (BFS over the process tree)
+/// and return its launch flags (argv after the program name). Linux-only
+/// (/proc); returns empty if no claude process is found.
+fn claude_launch_flags(root_pid: u32) -> Vec<String> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for e in entries.flatten() {
+            if let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) {
+                if let Some(ppid) = proc_ppid(pid) {
+                    children.entry(ppid).or_default().push(pid);
+                }
+            }
+        }
+    }
+    let mut queue = VecDeque::from([root_pid]);
+    let mut seen = HashSet::new();
+    while let Some(pid) = queue.pop_front() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        let argv = proc_argv(pid);
+        if argv0_is_claude(&argv) {
+            return argv[1..].to_vec();
+        }
+        if let Some(kids) = children.get(&pid) {
+            queue.extend(kids.iter().copied());
+        }
+    }
+    Vec::new()
 }
 
 pub struct FakeTmux {
     calls: Mutex<Vec<String>>,
     panes: Mutex<Vec<PaneInfo>>,
+    launch_flags: Mutex<Vec<String>>,
 }
 
 impl Default for FakeTmux {
@@ -114,7 +188,11 @@ impl Default for FakeTmux {
 
 impl FakeTmux {
     pub fn new() -> Self {
-        FakeTmux { calls: Mutex::new(Vec::new()), panes: Mutex::new(Vec::new()) }
+        FakeTmux {
+            calls: Mutex::new(Vec::new()),
+            panes: Mutex::new(Vec::new()),
+            launch_flags: Mutex::new(Vec::new()),
+        }
     }
 
     pub fn calls(&self) -> Vec<String> {
@@ -123,6 +201,10 @@ impl FakeTmux {
 
     pub fn set_panes(&self, panes: Vec<PaneInfo>) {
         *self.panes.lock().unwrap() = panes;
+    }
+
+    pub fn set_launch_flags(&self, flags: Vec<String>) {
+        *self.launch_flags.lock().unwrap() = flags;
     }
 }
 
@@ -153,6 +235,10 @@ impl TmuxControl for FakeTmux {
 
     fn list_panes(&self) -> anyhow::Result<Vec<PaneInfo>> {
         Ok(self.panes.lock().unwrap().clone())
+    }
+
+    fn pane_launch_flags(&self, _pane: &str) -> anyhow::Result<Vec<String>> {
+        Ok(self.launch_flags.lock().unwrap().clone())
     }
 }
 
