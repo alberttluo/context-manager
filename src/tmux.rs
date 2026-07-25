@@ -12,6 +12,13 @@ pub struct PaneInfo {
 pub trait TmuxControl {
     fn send_text(&self, pane: &str, text: &str) -> anyhow::Result<()>;
     fn send_enter(&self, pane: &str) -> anyhow::Result<()>;
+    /// Discard whatever is sitting on the current input line (C-u), so a retried
+    /// send never concatenates onto a partially-delivered previous attempt.
+    fn clear_input(&self, pane: &str) -> anyhow::Result<()>;
+    /// The pane's visible text, used to confirm that keystrokes actually landed.
+    fn capture_pane(&self, pane: &str) -> anyhow::Result<String>;
+    /// The pane's current foreground command (e.g. "claude", "zsh").
+    fn pane_command(&self, pane: &str) -> anyhow::Result<String>;
     fn respawn_shell(&self, pane: &str) -> anyhow::Result<()>;
     fn pane_alive(&self, pane: &str) -> anyhow::Result<bool>;
     fn display_message(&self, pane: &str, msg: &str) -> anyhow::Result<()>;
@@ -47,6 +54,30 @@ impl TmuxControl for RealTmux {
             bail!("tmux send-keys Enter failed for pane {pane}");
         }
         Ok(())
+    }
+
+    fn clear_input(&self, pane: &str) -> anyhow::Result<()> {
+        let out = RealTmux::run(&["send-keys", "-t", pane, "C-u"])?;
+        if !out.status.success() {
+            bail!("tmux send-keys C-u failed for pane {pane}");
+        }
+        Ok(())
+    }
+
+    fn capture_pane(&self, pane: &str) -> anyhow::Result<String> {
+        let out = RealTmux::run(&["capture-pane", "-p", "-t", pane])?;
+        if !out.status.success() {
+            bail!("tmux capture-pane failed for pane {pane}");
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    fn pane_command(&self, pane: &str) -> anyhow::Result<String> {
+        let out = RealTmux::run(&["display-message", "-p", "-t", pane, "#{pane_current_command}"])?;
+        if !out.status.success() {
+            bail!("tmux display-message failed for pane {pane}");
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
 
     fn respawn_shell(&self, pane: &str) -> anyhow::Result<()> {
@@ -174,10 +205,23 @@ fn claude_launch_flags(root_pid: u32) -> Vec<String> {
     Vec::new()
 }
 
+/// In-memory tmux stand-in that simulates a pane well enough to exercise the
+/// verified-send protocol: text accumulates in an "input box", Enter submits it,
+/// and `swallow_sends` reproduces the real failure where a TUI that is not yet
+/// reading input silently discards keystrokes.
 pub struct FakeTmux {
     calls: Mutex<Vec<String>>,
     panes: Mutex<Vec<PaneInfo>>,
     launch_flags: Mutex<Vec<String>>,
+    /// Text currently sitting on the pane's input line.
+    input_box: Mutex<String>,
+    /// Text already submitted/echoed above the input line.
+    scrollback: Mutex<String>,
+    pane_command: Mutex<String>,
+    /// Number of upcoming `send_text` calls to drop on the floor.
+    swallow_sends: Mutex<u32>,
+    /// Whether submitting a `claude ...` command line actually starts claude.
+    successor_starts: Mutex<bool>,
 }
 
 impl Default for FakeTmux {
@@ -192,6 +236,11 @@ impl FakeTmux {
             calls: Mutex::new(Vec::new()),
             panes: Mutex::new(Vec::new()),
             launch_flags: Mutex::new(Vec::new()),
+            input_box: Mutex::new(String::new()),
+            scrollback: Mutex::new(String::new()),
+            pane_command: Mutex::new("claude".to_string()),
+            swallow_sends: Mutex::new(0),
+            successor_starts: Mutex::new(true),
         }
     }
 
@@ -206,21 +255,75 @@ impl FakeTmux {
     pub fn set_launch_flags(&self, flags: Vec<String>) {
         *self.launch_flags.lock().unwrap() = flags;
     }
+
+    /// Drop the next `n` `send_text` calls, as a not-yet-ready TUI does.
+    pub fn swallow_next_sends(&self, n: u32) {
+        *self.swallow_sends.lock().unwrap() = n;
+    }
+
+    /// When false, typing a `claude ...` line into the shell never brings claude
+    /// up — the observed "handoff reported success but no successor" failure.
+    pub fn set_successor_starts(&self, yes: bool) {
+        *self.successor_starts.lock().unwrap() = yes;
+    }
+
+    pub fn set_pane_command(&self, cmd: &str) {
+        *self.pane_command.lock().unwrap() = cmd.to_string();
+    }
 }
 
 impl TmuxControl for FakeTmux {
     fn send_text(&self, pane: &str, text: &str) -> anyhow::Result<()> {
         self.calls.lock().unwrap().push(format!("send_text:{pane}:{text}"));
+        let mut swallow = self.swallow_sends.lock().unwrap();
+        if *swallow > 0 {
+            *swallow -= 1;
+            return Ok(()); // keystrokes discarded, exactly as a cold TUI does
+        }
+        self.input_box.lock().unwrap().push_str(text);
         Ok(())
     }
 
     fn send_enter(&self, pane: &str) -> anyhow::Result<()> {
         self.calls.lock().unwrap().push(format!("send_enter:{pane}"));
+        let submitted = std::mem::take(&mut *self.input_box.lock().unwrap());
+        if submitted.is_empty() {
+            return Ok(());
+        }
+        self.scrollback.lock().unwrap().push_str(&format!("{submitted}\n"));
+        // A `claude ...` line typed at a shell prompt starts claude in the pane.
+        let is_shell = { self.pane_command.lock().unwrap().as_str() != "claude" };
+        if is_shell && submitted.trim_start().starts_with("claude") && *self.successor_starts.lock().unwrap() {
+            *self.pane_command.lock().unwrap() = "claude".to_string();
+        }
         Ok(())
+    }
+
+    fn clear_input(&self, pane: &str) -> anyhow::Result<()> {
+        self.calls.lock().unwrap().push(format!("clear_input:{pane}"));
+        self.input_box.lock().unwrap().clear();
+        Ok(())
+    }
+
+    fn capture_pane(&self, _pane: &str) -> anyhow::Result<String> {
+        // Mirror the real TUI: scrollback, then the input box inside a frame.
+        let border = "─".repeat(40);
+        Ok(format!(
+            "{}\n{border}\n❯ {}\n{border}\n",
+            self.scrollback.lock().unwrap(),
+            self.input_box.lock().unwrap()
+        ))
+    }
+
+    fn pane_command(&self, _pane: &str) -> anyhow::Result<String> {
+        Ok(self.pane_command.lock().unwrap().clone())
     }
 
     fn respawn_shell(&self, pane: &str) -> anyhow::Result<()> {
         self.calls.lock().unwrap().push(format!("respawn_shell:{pane}"));
+        *self.pane_command.lock().unwrap() = "zsh".to_string();
+        self.input_box.lock().unwrap().clear();
+        self.scrollback.lock().unwrap().clear();
         Ok(())
     }
 

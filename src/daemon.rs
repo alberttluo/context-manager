@@ -1,8 +1,8 @@
 use crate::config::Config;
-use crate::handoff::{perform_handoff, HandoffOptions};
+use crate::handoff::{perform_handoff, HandoffOptions, HandoffOutcome};
 use crate::lineage::{self, LineageRecord};
 use crate::model_window::resolve_window;
-use crate::monitor::{SessionMonitor, TickInput, TickOutcome};
+use crate::monitor::{SessionMonitor, TickInput, TickOutcome, MAX_HANDOFF_FAILURES};
 use crate::paths::Paths;
 use crate::registration::{self, Registration};
 use crate::transcript;
@@ -71,6 +71,12 @@ impl<'a> Daemon<'a> {
         monitors: &mut HashMap<String, SessionMonitor>,
         mtimes: &mut MtimeTracker,
     ) -> anyhow::Result<()> {
+        // Enforce the ignore list here rather than only in discovery: sessions
+        // also arrive via the SessionStart hook, which has no config, so an
+        // ignored cwd was still being handed off through that path.
+        if self.is_ignored(&reg.cwd.to_string_lossy()) {
+            return Ok(());
+        }
         let state = transcript::analyze(&reg.transcript_path)?;
         let window = resolve_window(state.model.as_deref(), state.max_context_tokens, &self.config);
         let pct = if window == 0 { 0.0 } else { state.context_tokens as f64 / window as f64 };
@@ -97,6 +103,12 @@ impl<'a> Daemon<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Whether a cwd is excluded from management. Matching mirrors discovery's
+    /// substring test so both registration paths agree.
+    fn is_ignored(&self, cwd: &str) -> bool {
+        self.config.ignore_cwds.iter().any(|ig| cwd.contains(ig.as_str()))
     }
 
     fn notify_grace(&self, reg: &Registration) {
@@ -132,9 +144,10 @@ impl<'a> Daemon<'a> {
             session_id: reg.session_id.clone(),
             handoff_dir: self.paths.handoff_dir(),
             timeout_secs: self.config.handoff_timeout_secs,
+            transcript_path: reg.transcript_path.clone(),
         };
         match perform_handoff(self.tmux, &opts, |d: Duration| std::thread::sleep(d)) {
-            Ok(handoff_path) => {
+            Ok(HandoffOutcome::Completed(handoff_path)) => {
                 monitor.note_handoff_done(now);
                 // The old session is being retired; remove its registration so we
                 // stop evaluating it. The successor re-registers via its own hook.
@@ -142,11 +155,35 @@ impl<'a> Daemon<'a> {
                 self.log_lineage(reg, pct, &handoff_path.to_string_lossy(), false);
                 eprintln!("[cm] handed off session {} -> pane {}", reg.session_id, reg.tmux_pane);
             }
+            Ok(HandoffOutcome::Superseded) => {
+                // The human is driving again. Back off silently; the next quiet
+                // period will reconsider. Not a failure, so no backoff escalation.
+                monitor.note_superseded(now);
+                eprintln!(
+                    "[cm] handoff superseded by user activity for session {} (session left intact)",
+                    reg.session_id
+                );
+            }
             Err(e) => {
-                // Abort cleanly: leave the session untouched, start cooldown to
-                // avoid retry storms, log the failure.
-                monitor.note_handoff_done(now);
-                eprintln!("[cm] handoff FAILED for session {}: {e:#} (session left intact)", reg.session_id);
+                // Leave the session untouched and start (escalating) cooldown.
+                let failures = monitor.note_handoff_failed(now);
+                eprintln!(
+                    "[cm] handoff FAILED for session {} (attempt {failures}/{MAX_HANDOFF_FAILURES}): {e:#} (session left intact)",
+                    reg.session_id
+                );
+                // Failures were previously invisible in the lineage log, which
+                // made repeated attempts impossible to spot after the fact.
+                self.log_lineage(reg, pct, &format!("FAILED: {e}"), false);
+                if monitor.is_abandoned() {
+                    eprintln!(
+                        "[cm] giving up on session {} after {MAX_HANDOFF_FAILURES} failed handoffs",
+                        reg.session_id
+                    );
+                    let _ = self.tmux.display_message(
+                        &reg.tmux_pane,
+                        "[context-manager] handoff failed repeatedly — managing this session is paused",
+                    );
+                }
             }
         }
         Ok(())
@@ -321,6 +358,66 @@ mod tests {
         assert!(
             !calls.iter().any(|c| c.starts_with("respawn:")),
             "unexpected respawn call: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn ignored_cwd_is_never_handed_off_even_when_hook_registered() {
+        let base = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::with_base(
+            base.path().join("config"),
+            base.path().join("state"),
+        );
+
+        // Over threshold, idle, sitting at a finished assistant turn — eligible
+        // in every respect except that its cwd is excluded.
+        let transcript = base.path().join("sess.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"assistant\",\"message\":{\"model\":\"m\",\"usage\":{\"cache_read_input_tokens\":180000}}}\n",
+        )
+        .unwrap();
+
+        // The SessionStart hook has no config, so it registers ignored cwds too.
+        registration::write(&paths.sessions_dir(), &Registration {
+            session_id: "ignored-sess".into(),
+            transcript_path: transcript,
+            cwd: "/mnt/c/Users/Albert Luo/Desktop/tang-dynasty".into(),
+            tmux_pane: "%9".into(),
+            pid: 1,
+            started_at: "2026-07-25T12:00:00Z".into(),
+        }).unwrap();
+
+        let config = Config {
+            dry_run: false,
+            quiet_period_secs: 0,
+            grace_secs: 0,
+            ignore_cwds: vec!["/mnt/c/Users/Albert Luo/Desktop/tang-dynasty".to_string()],
+            ..Default::default()
+        };
+
+        let fake = FakeTmux::new();
+        let projects_dir = tempfile::tempdir().unwrap();
+        let daemon = Daemon {
+            config,
+            paths: &paths,
+            tmux: &fake,
+            claude_projects_dir: projects_dir.path().to_path_buf(),
+        };
+
+        let mut monitors: HashMap<String, SessionMonitor> = HashMap::new();
+        let mut mtimes = MtimeTracker::default();
+        let t0 = Instant::now();
+        // Several ticks: with grace_secs = 0 an unfiltered session would reach
+        // ExecuteHandoff almost immediately.
+        for _ in 0..4 {
+            daemon.tick(t0, &mut monitors, &mut mtimes).unwrap();
+        }
+
+        assert!(
+            fake.calls().is_empty(),
+            "ignored cwd must never be touched, got: {:?}",
+            fake.calls()
         );
     }
 
