@@ -382,7 +382,7 @@ mod tests {
         registration::write(&paths.sessions_dir(), &Registration {
             session_id: "ignored-sess".into(),
             transcript_path: transcript,
-            cwd: "/mnt/c/Users/Albert Luo/Desktop/tang-dynasty".into(),
+            cwd: "/mnt/c/Users/someone/Desktop/excluded-project".into(),
             tmux_pane: "%9".into(),
             pid: 1,
             started_at: "2026-07-25T12:00:00Z".into(),
@@ -392,7 +392,7 @@ mod tests {
             dry_run: false,
             quiet_period_secs: 0,
             grace_secs: 0,
-            ignore_cwds: vec!["/mnt/c/Users/Albert Luo/Desktop/tang-dynasty".to_string()],
+            ignore_cwds: vec!["/mnt/c/Users/someone/Desktop/excluded-project".to_string()],
             ..Default::default()
         };
 
