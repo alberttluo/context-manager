@@ -79,10 +79,35 @@ impl<'a> Daemon<'a> {
         }
         let state = transcript::analyze(&reg.transcript_path)?;
         let window = resolve_window(state.model.as_deref(), state.max_context_tokens, &self.config);
-        let pct = if window == 0 { 0.0 } else { state.context_tokens as f64 / window as f64 };
+        let pct = if window.tokens == 0 { 0.0 } else { state.context_tokens as f64 / window.tokens as f64 };
         let changed = mtimes.changed(&reg.session_id, mtime_secs(&reg.transcript_path));
 
         let monitor = monitors.entry(reg.session_id.clone()).or_insert_with(|| SessionMonitor::new(now));
+
+        // Say out loud when the window is a guess. It is the one input here that
+        // can be badly wrong while every other sign of health looks fine, and a
+        // model id gives no hint of its own window: Claude Code writes the 1M
+        // Opus variant as plain "claude-opus-5", exactly what a 200k session
+        // reports. Guessing 200k for a 1M session hands it off at 9% of its real
+        // context, and the empirical correction never rescues it — the session is
+        // retired long before it can be observed above 200k.
+        //
+        // Warn rather than refuse: for a model whose window really is the
+        // default this estimate is correct, and refusing would leave those
+        // sessions unmanaged forever, since observation can never confirm a
+        // window it does not exceed.
+        if window.is_guess() {
+            if let Some(model) = state.model.as_deref() {
+                if monitor.note_guessed_window(model) {
+                    eprintln!(
+                        "[cm] WARNING: unknown model {model:?} — assuming the {}-token default \
+                         and handing off at {:.0}%. Add it to [model_windows] if that is wrong.",
+                        window.tokens,
+                        self.config.threshold * 100.0,
+                    );
+                }
+            }
+        }
         let outcome = monitor.tick(now, &TickInput {
             context_pct: pct,
             threshold: self.config.threshold,

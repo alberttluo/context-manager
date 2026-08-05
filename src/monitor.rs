@@ -39,6 +39,9 @@ pub struct SessionMonitor {
     consecutive_failures: u32,
     /// Set once the failure cap is hit; no further handoffs are attempted.
     abandoned: bool,
+    /// The unlisted model already warned about, so the warning does not repeat
+    /// on every poll.
+    warned_model: Option<String>,
 }
 
 impl SessionMonitor {
@@ -49,7 +52,19 @@ impl SessionMonitor {
             cooldown_until: None,
             consecutive_failures: 0,
             abandoned: false,
+            warned_model: None,
         }
+    }
+
+    /// True the first time this session is seen running an unlisted model, and
+    /// again if it switches to a different unlisted one. Polling is every few
+    /// seconds, so an unconditional warning would bury the journal.
+    pub fn note_guessed_window(&mut self, model: &str) -> bool {
+        if self.warned_model.as_deref() == Some(model) {
+            return false;
+        }
+        self.warned_model = Some(model.to_string());
+        true
     }
 
     pub fn note_handoff_done(&mut self, now: Instant) {
@@ -256,6 +271,20 @@ mod tests {
 
     fn m_after(t: Instant, secs: u64) -> Instant {
         t + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn warns_once_per_unlisted_model() {
+        let mut m = SessionMonitor::new(Instant::now());
+        assert!(m.note_guessed_window("claude-opus-5"));
+        // Polling is every few seconds; repeating this would bury the journal.
+        assert!(!m.note_guessed_window("claude-opus-5"));
+        assert!(!m.note_guessed_window("claude-opus-5"));
+        // A session that switches model is a new fact, and worth saying again.
+        assert!(m.note_guessed_window("claude-sonnet-5"));
+        assert!(!m.note_guessed_window("claude-sonnet-5"));
+        // Switching back is also new information relative to the last warning.
+        assert!(m.note_guessed_window("claude-opus-5"));
     }
 
     #[test]
