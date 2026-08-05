@@ -24,18 +24,23 @@ command -v jq   >/dev/null || die "jq not found — sudo apt install -y jq"
 command -v tmux >/dev/null || log "WARNING: tmux not found — the daemon only manages sessions started inside tmux (sudo apt install -y tmux)"
 
 # 2. Build -------------------------------------------------------------------
+# Honour CARGO_TARGET_DIR: cargo writes there instead of $REPO_ROOT/target, so
+# assuming the latter would look for binaries that were never put there. This
+# matters when the checkout lives somewhere the build output must not — vendored
+# inside another repo, or on a volume with a quota.
+RELEASE_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}/release"
 if [ "$SKIP_BUILD" -eq 0 ]; then
   command -v cargo >/dev/null || die "cargo not found — install Rust (https://rustup.rs) or pass --skip-build"
   log "building release binaries..."
   ( cd "$REPO_ROOT" && cargo build --release )
 fi
-[ -x "$REPO_ROOT/target/release/context-managerd" ] || die "context-managerd not built (drop --skip-build)"
-[ -x "$REPO_ROOT/target/release/cm-hook" ]          || die "cm-hook not built (drop --skip-build)"
+[ -x "$RELEASE_DIR/context-managerd" ] || die "context-managerd not built at $RELEASE_DIR (drop --skip-build)"
+[ -x "$RELEASE_DIR/cm-hook" ]          || die "cm-hook not built at $RELEASE_DIR (drop --skip-build)"
 
 # 3. Install binaries --------------------------------------------------------
 mkdir -p "$BIN_DIR"
-install -m 0755 "$REPO_ROOT/target/release/context-managerd" "$BIN_DIR/"
-install -m 0755 "$REPO_ROOT/target/release/cm-hook"          "$BIN_DIR/"
+install -m 0755 "$RELEASE_DIR/context-managerd" "$BIN_DIR/"
+install -m 0755 "$RELEASE_DIR/cm-hook"          "$BIN_DIR/"
 log "installed binaries -> $BIN_DIR"
 
 # 4. Config (never clobber an existing one) ----------------------------------
