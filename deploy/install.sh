@@ -87,8 +87,14 @@ loginctl enable-linger "$USER" 2>/dev/null \
   || sudo loginctl enable-linger "$USER" 2>/dev/null \
   || log "WARNING: could not enable linger — service will stop when you log out"
 systemctl --user daemon-reload
-systemctl --user enable --now context-manager
-log "service enabled and started"
+systemctl --user enable context-manager
+# `enable --now` starts a stopped unit but does nothing to a running one, so an
+# already-running daemon kept executing the binary it started with while this
+# script reported success — the new binaries only took effect at the next
+# reboot. Step 3 just replaced them, so restart unconditionally. `restart` also
+# starts a unit that is not running, which is why it replaces --now outright.
+systemctl --user restart context-manager
+log "service enabled and restarted onto the new binaries"
 
 cat <<EOF
 
