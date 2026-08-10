@@ -83,8 +83,27 @@ log "wired SessionStart/SessionEnd hooks -> $SETTINGS"
 mkdir -p "$UNIT_DIR"
 install -m 0644 "$REPO_ROOT/deploy/context-manager.service" "$UNIT_DIR/"
 # Linger keeps the --user service alive after you disconnect (essential on a VM).
-loginctl enable-linger "$USER" 2>/dev/null \
-  || sudo loginctl enable-linger "$USER" 2>/dev/null \
+#
+# Root is only needed on hosts where the unprivileged call is refused. Try it
+# without sudo, then passwordless sudo, and only then ask for a password — and
+# only if there is a terminal to ask on, since an unattended install has nobody
+# to type one and would otherwise block forever. The previous `sudo ... 2>/dev/null`
+# managed the worst of both: it could still prompt, but with its own error
+# output discarded.
+enable_linger() {
+  loginctl enable-linger "$USER" 2>/dev/null && return 0
+  command -v sudo >/dev/null 2>&1 || return 1
+  sudo -n loginctl enable-linger "$USER" 2>/dev/null && return 0
+  { [ -t 0 ] && [ -t 2 ]; } || return 1
+  log "enabling linger needs root — enter your password, or leave it empty to skip"
+  # stderr left alone here: a prompt you cannot see is worse than no prompt.
+  sudo -v || return 1
+  sudo -n loginctl enable-linger "$USER" 2>/dev/null
+}
+
+# A missing password is not fatal. Linger is a nicety; without it the daemon
+# simply stops when you log out, which the warning says plainly.
+enable_linger \
   || log "WARNING: could not enable linger — service will stop when you log out"
 systemctl --user daemon-reload
 systemctl --user enable context-manager
