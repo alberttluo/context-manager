@@ -1,17 +1,30 @@
 #!/usr/bin/env bash
 # context-manager installer — build, install binaries, write config, wire the
-# Claude Code hooks, and start the systemd --user service.
+# Claude Code hooks, and start the background service (systemd --user on Linux,
+# a launchd LaunchAgent on macOS).
 #
 # Idempotent: safe to re-run. Everything is user-level except enabling linger.
 # Usage:  bash deploy/install.sh [--skip-build]
 set -euo pipefail
 
+OS="$(uname -s)"
+case "$OS" in
+  Linux|Darwin) ;;
+  *) printf 'unsupported OS: %s (Linux and macOS only)\n' "$OS" >&2; exit 1 ;;
+esac
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN_DIR="$HOME/.local/bin"
+# Must match paths.rs, which uses these XDG locations on macOS too — the native
+# ~/Library/Application Support would be a config the daemon never reads.
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/context-manager"
 CONFIG_FILE="$CONFIG_DIR/config.toml"
 SETTINGS="$HOME/.claude/settings.json"
 UNIT_DIR="$HOME/.config/systemd/user"
+AGENT_LABEL="com.context-manager.daemon"
+AGENT_DIR="$HOME/Library/LaunchAgents"
+AGENT_PLIST="$AGENT_DIR/$AGENT_LABEL.plist"
+MAC_LOG="$HOME/Library/Logs/context-manager.log"
 HOOK_CMD="$BIN_DIR/cm-hook"   # absolute path so it resolves regardless of shell
 SKIP_BUILD=0
 [ "${1:-}" = "--skip-build" ] && SKIP_BUILD=1
@@ -20,8 +33,9 @@ log() { printf '\033[1;34m[install]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[install] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
 # 1. Dependencies ------------------------------------------------------------
-command -v jq   >/dev/null || die "jq not found — sudo apt install -y jq"
-command -v tmux >/dev/null || log "WARNING: tmux not found — the daemon only manages sessions started inside tmux (sudo apt install -y tmux)"
+if [ "$OS" = Darwin ]; then INSTALL_HINT="brew install"; else INSTALL_HINT="sudo apt install -y"; fi
+command -v jq   >/dev/null || die "jq not found — $INSTALL_HINT jq"
+command -v tmux >/dev/null || log "WARNING: tmux not found — the daemon only manages sessions started inside tmux ($INSTALL_HINT tmux)"
 
 # 2. Build -------------------------------------------------------------------
 # Honour CARGO_TARGET_DIR: cargo writes there instead of $REPO_ROOT/target, so
@@ -79,9 +93,7 @@ jq --arg cmd "$HOOK_CMD" '
 ' "$SETTINGS" > "$tmp" && mv "$tmp" "$SETTINGS"
 log "wired SessionStart/SessionEnd hooks -> $SETTINGS"
 
-# 6. systemd --user service --------------------------------------------------
-mkdir -p "$UNIT_DIR"
-install -m 0644 "$REPO_ROOT/deploy/context-manager.service" "$UNIT_DIR/"
+# 6. Background service ------------------------------------------------------
 # Linger keeps the --user service alive after you disconnect (essential on a VM).
 #
 # Root is only needed on hosts where the unprivileged call is refused. Try it
@@ -101,30 +113,85 @@ enable_linger() {
   sudo -n loginctl enable-linger "$USER" 2>/dev/null
 }
 
-# A missing password is not fatal. Linger is a nicety; without it the daemon
-# simply stops when you log out, which the warning says plainly.
-enable_linger \
-  || log "WARNING: could not enable linger — service will stop when you log out"
-systemctl --user daemon-reload
-systemctl --user enable context-manager
-# `enable --now` starts a stopped unit but does nothing to a running one, so an
-# already-running daemon kept executing the binary it started with while this
-# script reported success — the new binaries only took effect at the next
-# reboot. Step 3 just replaced them, so restart unconditionally. `restart` also
-# starts a unit that is not running, which is why it replaces --now outright.
-systemctl --user restart context-manager
-log "service enabled and restarted onto the new binaries"
+install_service_linux() {
+  mkdir -p "$UNIT_DIR"
+  install -m 0644 "$REPO_ROOT/deploy/context-manager.service" "$UNIT_DIR/"
+  # A missing password is not fatal. Linger is a nicety; without it the daemon
+  # simply stops when you log out, which the warning says plainly.
+  enable_linger \
+    || log "WARNING: could not enable linger — service will stop when you log out"
+  systemctl --user daemon-reload
+  systemctl --user enable context-manager
+  # `enable --now` starts a stopped unit but does nothing to a running one, so an
+  # already-running daemon kept executing the binary it started with while this
+  # script reported success — the new binaries only took effect at the next
+  # reboot. Step 3 just replaced them, so restart unconditionally. `restart` also
+  # starts a unit that is not running, which is why it replaces --now outright.
+  systemctl --user restart context-manager
+  log "service enabled and restarted onto the new binaries"
+}
+
+# macOS has no systemd; the equivalent is a per-user LaunchAgent. It needs no
+# linger equivalent — launchd starts the agent at login on its own — but it also
+# has no journald, so the daemon's stderr is redirected to a log file.
+install_service_macos() {
+  mkdir -p "$AGENT_DIR" "$(dirname "$MAC_LOG")"
+
+  # tmux is how the daemon reaches sessions, and an agent's inherited PATH does
+  # not include Homebrew, so tmux's actual directory is baked into the plist.
+  local tmux_bin agent_path="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+  tmux_bin="$(command -v tmux || true)"
+  [ -n "$tmux_bin" ] && agent_path="$(dirname "$tmux_bin"):$agent_path"
+
+  sed -e "s|__BIN__|$BIN_DIR/context-managerd|g" \
+      -e "s|__LOG__|$MAC_LOG|g" \
+      -e "s|__PATH__|$agent_path|g" \
+      "$REPO_ROOT/deploy/$AGENT_LABEL.plist" > "$AGENT_PLIST"
+
+  local uid target
+  uid="$(id -u)"
+  target="gui/$uid"
+  # An ssh-only session has no GUI (Aqua) domain to bootstrap into. Fall back to
+  # the legacy load, which uses the calling session's own domain — the daemon
+  # then dies with that session, the same caveat linger covers on Linux.
+  if ! launchctl print "$target" >/dev/null 2>&1; then
+    log "WARNING: no GUI login session — loading into this session instead; the daemon will stop when it ends"
+    launchctl unload "$AGENT_PLIST" 2>/dev/null || true
+    launchctl load -w "$AGENT_PLIST"
+    return
+  fi
+
+  # `enable` first: bootstrap refuses a label the user previously disabled.
+  launchctl enable "$target/$AGENT_LABEL" 2>/dev/null || true
+  # bootout then bootstrap is a full reload. It is also what moves an
+  # already-running daemon onto the binaries step 3 just installed — bootstrap
+  # alone fails outright on a loaded agent, leaving the old process in place.
+  launchctl bootout "$target/$AGENT_LABEL" 2>/dev/null || true
+  launchctl bootstrap "$target" "$AGENT_PLIST" \
+    || die "launchctl bootstrap failed for $AGENT_PLIST"
+  log "LaunchAgent loaded and restarted onto the new binaries"
+}
+
+if [ "$OS" = Darwin ]; then install_service_macos; else install_service_linux; fi
+
+if [ "$OS" = Darwin ]; then
+  LOGS_CMD="tail -f $MAC_LOG"
+  RESTART_CMD="launchctl kickstart -k gui/\$(id -u)/$AGENT_LABEL"
+else
+  LOGS_CMD="journalctl --user -u context-manager -f"
+  RESTART_CMD="systemctl --user restart context-manager"
+fi
 
 cat <<EOF
 
 Done.
-  Logs:   journalctl --user -u context-manager -f
+  Logs:   $LOGS_CMD
   Config: $CONFIG_FILE
 
 Validate, then go live:
   1. Start a 'claude' session INSIDE tmux (sessions outside tmux are ignored).
-  2. Confirm in the journal: "discovered N new session(s)" and, past threshold,
+  2. Confirm in the log: "discovered N new session(s)" and, past threshold,
      "DRY-RUN would hand off ...".
   3. Edit $CONFIG_FILE -> dry_run = false, then:
-       systemctl --user restart context-manager
+       $RESTART_CMD
 EOF

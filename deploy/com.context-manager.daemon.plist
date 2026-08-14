@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template: install.sh substitutes the __PLACEHOLDERS__ and writes the result to
+  ~/Library/LaunchAgents/. launchd expands neither ~ nor environment variables in
+  a plist, so every path here has to arrive already absolute.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.context-manager.daemon</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__BIN__</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <!-- launchd's own floor is 10s; this is the analogue of systemd RestartSec. -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <!-- There is no journald here, so the daemon's stderr goes to a log file. -->
+  <key>StandardOutPath</key>
+  <string>__LOG__</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG__</string>
+
+  <!--
+    A launchd agent inherits a minimal PATH that has no Homebrew in it, and the
+    daemon drives sessions by shelling out to tmux. Without tmux's real directory
+    here the daemon starts cleanly and then finds no panes at all.
+  -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PATH__</string>
+  </dict>
+</dict>
+</plist>

@@ -1,5 +1,8 @@
 # Installing the context manager
 
+Supported on Linux and macOS. `bash deploy/install.sh` does everything below and
+picks the right service manager for the platform; the manual steps follow.
+
 ## 1. Build and install the binaries
 
 ```bash
@@ -32,7 +35,10 @@ outside tmux are ignored.
 
 ## 3. Create config (optional — defaults are sane)
 
-`~/.config/context-manager/config.toml`:
+`~/.config/context-manager/config.toml` — on macOS too, not
+`~/Library/Application Support`. State lives in `~/.local/share/context-manager`
+on both platforms. (`$XDG_CONFIG_HOME` / `$XDG_DATA_HOME` override both if set to
+an absolute path.)
 
 ```toml
 threshold = 0.50
@@ -48,6 +54,8 @@ default = 200000
 
 ## 4. Install and start the service
 
+### Linux (systemd --user)
+
 ```bash
 mkdir -p ~/.config/systemd/user
 cp deploy/context-manager.service ~/.config/systemd/user/
@@ -55,6 +63,35 @@ systemctl --user daemon-reload
 systemctl --user enable --now context-manager
 journalctl --user -u context-manager -f
 ```
+
+### macOS (launchd)
+
+The plist is a template: launchd expands neither `~` nor environment variables,
+so substitute the absolute paths in. `__PATH__` must contain the directory tmux
+actually lives in — a LaunchAgent inherits a minimal PATH with no Homebrew, and
+the daemon reaches sessions by shelling out to tmux.
+
+```bash
+LABEL=com.context-manager.daemon
+mkdir -p ~/Library/LaunchAgents ~/Library/Logs
+sed -e "s|__BIN__|$HOME/.local/bin/context-managerd|g" \
+    -e "s|__LOG__|$HOME/Library/Logs/context-manager.log|g" \
+    -e "s|__PATH__|$(dirname "$(command -v tmux)"):/usr/bin:/bin:/usr/sbin:/sbin|g" \
+    deploy/$LABEL.plist > ~/Library/LaunchAgents/$LABEL.plist
+
+launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true   # no-op if not loaded
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/$LABEL.plist
+tail -f ~/Library/Logs/context-manager.log
+```
+
+There is no journald, hence the log file, and no linger to enable: launchd
+starts the agent at login by itself. Reload it after replacing the binaries —
+`bootout` then `bootstrap`, or `launchctl kickstart -k gui/$(id -u)/$LABEL` —
+since a running daemon otherwise keeps executing the old binary.
+
+Over SSH with nobody logged in at the console there is no `gui/$UID` domain to
+bootstrap into; `launchctl load -w ~/Library/LaunchAgents/$LABEL.plist` works
+there, but the daemon stops when that session ends.
 
 ## WSL2 caveat
 
