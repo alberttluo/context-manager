@@ -1,5 +1,5 @@
 use crate::transcript::{contains_ignoring_whitespace, prompt_stats};
-use crate::tmux::TmuxControl;
+use crate::tmux::{is_claude_command, TmuxControl};
 use anyhow::bail;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -313,7 +313,7 @@ where
         }
         tmux.send_enter(pane)?;
         if poll_until(SUCCESSOR_READY_SECS, sleep_fn, || {
-            tmux.pane_command(pane).map(|c| c == "claude").unwrap_or(false)
+            tmux.pane_command(pane).map(|c| is_claude_command(&c)).unwrap_or(false)
         }) {
             return Ok(());
         }

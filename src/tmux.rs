@@ -148,7 +148,18 @@ impl TmuxControl for RealTmux {
     }
 }
 
+/// One process as the tree walk needs it. `argv` is empty when the process's
+/// command line cannot be read (a permissions failure, or the process exiting
+/// between listing and reading).
+#[derive(Debug, Clone, PartialEq)]
+struct ProcessEntry {
+    pid: u32,
+    ppid: u32,
+    argv: Vec<String>,
+}
+
 /// argv of a process from /proc/<pid>/cmdline (NUL-delimited), or empty.
+#[cfg(target_os = "linux")]
 fn proc_argv(pid: u32) -> Vec<String> {
     match std::fs::read(format!("/proc/{pid}/cmdline")) {
         Ok(bytes) => bytes
@@ -160,6 +171,7 @@ fn proc_argv(pid: u32) -> Vec<String> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn proc_ppid(pid: u32) -> Option<u32> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     status
@@ -167,26 +179,86 @@ fn proc_ppid(pid: u32) -> Option<u32> {
         .find_map(|line| line.strip_prefix("PPid:").and_then(|r| r.trim().parse().ok()))
 }
 
+/// Every process on the machine, read from /proc.
+#[cfg(target_os = "linux")]
+fn process_table() -> Vec<ProcessEntry> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()))
+        .filter_map(|pid| {
+            proc_ppid(pid).map(|ppid| ProcessEntry { pid, ppid, argv: proc_argv(pid) })
+        })
+        .collect()
+}
+
+/// Every process on the machine, read from `ps` — the portable source where
+/// there is no /proc (macOS, the BSDs).
+#[cfg(not(target_os = "linux"))]
+fn process_table() -> Vec<ProcessEntry> {
+    let out = match Command::new("ps").args(["-Ao", "pid=,ppid=,args="]).output() {
+        Ok(out) if out.status.success() => out,
+        _ => return Vec::new(),
+    };
+    parse_ps_table(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parse `ps -Ao pid=,ppid=,args=` output: two numeric columns then the command
+/// line.
+///
+/// `ps` joins argv with spaces and cannot un-join it, so an argument that itself
+/// contains a space arrives split in two. Only the flags a successor is launched
+/// with are read from here, and those are shell-quoted again before use, so the
+/// damage is confined to an unusual flag value being passed as two arguments —
+/// worth accepting for a process list that needs no extra dependency. On Linux,
+/// where /proc/<pid>/cmdline delimits argv with NULs, no such split happens.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn parse_ps_table(stdout: &str) -> Vec<ProcessEntry> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let ppid = fields.next()?.parse().ok()?;
+            let argv = fields.map(str::to_string).collect();
+            Some(ProcessEntry { pid, ppid, argv })
+        })
+        .collect()
+}
+
+/// Whether a command name (a pane's foreground command, or an argv[0]) is the
+/// Claude Code CLI.
+///
+/// The `.exe` is not a typo and not Windows: Claude Code ships its macOS binary
+/// as `bin/claude.exe`, and tmux on macOS derives `pane_current_command` from
+/// the executable path, so panes report `claude.exe` there and plain `claude` on
+/// Linux. Matching only the bare name silently disables the whole daemon on
+/// macOS — no pane is ever recognised as a session.
+pub fn is_claude_command(command: &str) -> bool {
+    let base = command.rsplit('/').next().unwrap_or(command);
+    base.strip_suffix(".exe").unwrap_or(base) == "claude"
+}
+
 fn argv0_is_claude(argv: &[String]) -> bool {
-    argv.first()
-        .map(|a| a.rsplit('/').next().unwrap_or(a) == "claude")
-        .unwrap_or(false)
+    argv.first().map(|a| is_claude_command(a)).unwrap_or(false)
 }
 
 /// Find the `claude` process at or below `root_pid` (BFS over the process tree)
-/// and return its launch flags (argv after the program name). Linux-only
-/// (/proc); returns empty if no claude process is found.
+/// and return its launch flags (argv after the program name). Empty if no
+/// claude process is found.
 fn claude_launch_flags(root_pid: u32) -> Vec<String> {
+    flags_from_table(&process_table(), root_pid)
+}
+
+fn flags_from_table(table: &[ProcessEntry], root_pid: u32) -> Vec<String> {
     use std::collections::{HashMap, HashSet, VecDeque};
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-    if let Ok(entries) = std::fs::read_dir("/proc") {
-        for e in entries.flatten() {
-            if let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) {
-                if let Some(ppid) = proc_ppid(pid) {
-                    children.entry(ppid).or_default().push(pid);
-                }
-            }
-        }
+    let mut argv_by_pid: HashMap<u32, &[String]> = HashMap::new();
+    for entry in table {
+        children.entry(entry.ppid).or_default().push(entry.pid);
+        argv_by_pid.insert(entry.pid, &entry.argv);
     }
     let mut queue = VecDeque::from([root_pid]);
     let mut seen = HashSet::new();
@@ -194,9 +266,10 @@ fn claude_launch_flags(root_pid: u32) -> Vec<String> {
         if !seen.insert(pid) {
             continue;
         }
-        let argv = proc_argv(pid);
-        if argv0_is_claude(&argv) {
-            return argv[1..].to_vec();
+        if let Some(argv) = argv_by_pid.get(&pid) {
+            if argv0_is_claude(argv) {
+                return argv[1..].to_vec();
+            }
         }
         if let Some(kids) = children.get(&pid) {
             queue.extend(kids.iter().copied());
@@ -292,7 +365,7 @@ impl TmuxControl for FakeTmux {
         }
         self.scrollback.lock().unwrap().push_str(&format!("{submitted}\n"));
         // A `claude ...` line typed at a shell prompt starts claude in the pane.
-        let is_shell = { self.pane_command.lock().unwrap().as_str() != "claude" };
+        let is_shell = { !is_claude_command(self.pane_command.lock().unwrap().as_str()) };
         if is_shell && submitted.trim_start().starts_with("claude") && *self.successor_starts.lock().unwrap() {
             *self.pane_command.lock().unwrap() = "claude".to_string();
         }
@@ -359,6 +432,85 @@ mod tests {
         assert_eq!(calls[0], "send_text:%1:hello");
         assert_eq!(calls[1], "send_enter:%1");
         assert_eq!(calls[2], "respawn_shell:%1");
+    }
+
+    #[test]
+    fn recognises_claude_under_both_platforms_names() {
+        // Linux tmux reports the bare name; macOS tmux reports the executable,
+        // which Claude Code ships as claude.exe.
+        assert!(is_claude_command("claude"));
+        assert!(is_claude_command("claude.exe"));
+        assert!(is_claude_command("/opt/homebrew/bin/claude"));
+        assert!(is_claude_command(
+            "/Users/u/.nvm/versions/node/v24.2.0/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+        ));
+        assert!(!is_claude_command("zsh"));
+        assert!(!is_claude_command("claude-code"));
+        assert!(!is_claude_command("notclaude"));
+    }
+
+    #[test]
+    fn parses_ps_output_including_a_command_line_with_spaces() {
+        let stdout = "\
+    1     0 /sbin/launchd
+ 4210  4207 -zsh
+ 4288  4210 node /opt/homebrew/bin/claude --model opus
+ 4290  4288 /bin/sh -c echo hi
+  bad line without numbers
+";
+        let table = parse_ps_table(stdout);
+        assert_eq!(table.len(), 4, "expected the unparseable line to be skipped: {table:?}");
+        assert_eq!(table[0], ProcessEntry { pid: 1, ppid: 0, argv: vec!["/sbin/launchd".into()] });
+        assert_eq!(table[2].pid, 4288);
+        assert_eq!(table[2].ppid, 4210);
+        assert_eq!(
+            table[2].argv,
+            vec!["node", "/opt/homebrew/bin/claude", "--model", "opus"],
+        );
+    }
+
+    /// Exercises the real platform source (/proc or `ps`), which the parser
+    /// tests cannot: a wrong `ps` invocation still parses to an empty table.
+    #[test]
+    fn process_table_sees_this_process() {
+        let table = process_table();
+        let me = std::process::id();
+        assert!(
+            table.iter().any(|e| e.pid == me),
+            "process table lacks our own pid {me} ({} entries)",
+            table.len(),
+        );
+    }
+
+    fn entry(pid: u32, ppid: u32, argv: &[&str]) -> ProcessEntry {
+        ProcessEntry { pid, ppid, argv: argv.iter().map(|s| s.to_string()).collect() }
+    }
+
+    #[test]
+    fn finds_claude_flags_below_the_pane_process() {
+        let table = vec![
+            entry(1, 0, &["/sbin/launchd"]),
+            entry(10, 1, &["-zsh"]),                                  // the pane
+            entry(20, 10, &["/usr/bin/claude", "--model", "opus"]),   // its claude
+            entry(30, 1, &["/usr/bin/claude", "--other-session"]),    // unrelated
+        ];
+        assert_eq!(flags_from_table(&table, 10), vec!["--model", "opus"]);
+    }
+
+    #[test]
+    fn no_claude_below_the_pane_yields_no_flags() {
+        let table = vec![entry(10, 1, &["-zsh"]), entry(20, 10, &["vim"])];
+        assert!(flags_from_table(&table, 10).is_empty());
+        // Unknown pid, and an empty table, are both simply "nothing found".
+        assert!(flags_from_table(&table, 999).is_empty());
+        assert!(flags_from_table(&[], 10).is_empty());
+    }
+
+    #[test]
+    fn a_parent_cycle_does_not_hang_the_walk() {
+        // Reparenting races can hand us a table where a pid is its own ancestor.
+        let table = vec![entry(10, 20, &["a"]), entry(20, 10, &["b"])];
+        assert!(flags_from_table(&table, 10).is_empty());
     }
 
     #[test]

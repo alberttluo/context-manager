@@ -38,7 +38,7 @@ pub fn discover_sessions(
 ) -> Vec<Registration> {
     let mut out = Vec::new();
     for p in panes {
-        if p.command != "claude" {
+        if !crate::tmux::is_claude_command(&p.command) {
             continue;
         }
         if ignore_cwds.iter().any(|ig| p.cwd.contains(ig.as_str())) {
@@ -97,6 +97,25 @@ mod tests {
 
         // Missing project dir returns None.
         assert!(find_active_transcript(root.path(), "/no/such/path").is_none());
+    }
+
+    #[test]
+    fn discovers_panes_reported_as_claude_exe_by_macos_tmux() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = "/Users/u/proj";
+        let proj_dir = root.path().join(encode_project_dir(cwd));
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        std::fs::write(proj_dir.join("sess-mac.jsonl"), "{}").unwrap();
+
+        let panes = vec![PaneInfo {
+            pane_id: "%46".into(),
+            cwd: cwd.into(),
+            command: "claude.exe".into(),
+        }];
+
+        let regs = discover_sessions(&panes, root.path(), &[]);
+        assert_eq!(regs.len(), 1, "macOS pane command must still register: {regs:?}");
+        assert_eq!(regs[0].session_id, "sess-mac");
     }
 
     #[test]
